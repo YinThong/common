@@ -1,0 +1,2 @@
+This repo contains a Makefile.common that is used by the Clear Linux internal
+Koji instance for running 'make sources' when building SRPMs.
