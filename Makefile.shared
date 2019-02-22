@@ -1,0 +1,197 @@
+#-*-makefile-*-
+
+define loopup
+	@[ "$(DEVICE)" ] || exit -1
+	@set -x; [ -z "$(FORCE)" ] || rm -rf $(TOPLVL)/image
+	@if [ -d $(TOPLVL)/image ]; then \
+		echo "Previous image mount in place at $(TOPLVL)/image. Run \`make loop-down\` to clean up first!"; \
+		exit 1; \
+	fi
+	@echo "Setting up loopback and mounting image..."
+	@mkdir -p $(TOPLVL)/image
+	@sudo losetup -d /dev/loop$(DEVICE) &> /dev/null || true
+	@sudo losetup /dev/loop$(DEVICE) $(TARGET)
+	@sudo partprobe /dev/loop$(DEVICE)
+	@sleep 1
+	@if [ -e /dev/loop$(DEVICE)p3 ]; then \
+		sudo mount /dev/loop$(DEVICE)p3 $(TOPLVL)/image; \
+	else \
+		sudo mount /dev/loop$(DEVICE)p2 $(TOPLVL)/image; \
+	fi
+	@sudo mount /dev/loop$(DEVICE)p1 $(TOPLVL)/image/boot
+endef
+
+define loopdown
+	@if [ ! -d $(TOPLVL)/image ]; then \
+		echo "Nothing to clean up."; \
+		exit 1; \
+	fi
+	@echo "Unmounting image and tearing down loopback..."
+	@sudo losetup -d /dev/loop$(DEVICE)p3 2>/dev/null || true
+	@sudo losetup -d /dev/loop$(DEVICE)p2 2>/dev/null || true
+	@sudo losetup -d /dev/loop$(DEVICE)p1 2>/dev/null || true
+	@sudo losetup -d /dev/loop$(DEVICE)   2>/dev/null || true
+	@sudo umount -l $(TOPLVL)/image/proc    2>/dev/null || true
+	@sudo umount -l $(TOPLVL)/image/sys     2>/dev/null || true
+	@sudo umount -l $(TOPLVL)/image/dev     2>/dev/null || true
+	@sudo umount -l $(TOPLVL)/image/boot    2>/dev/null || true
+	@sudo umount -l -R $(TOPLVL)/image; if [ $$? != 0 ]; then \
+		sudo umount -l $(TOPLVL)/image; \
+	fi
+	@sync
+	@sleep 1
+	@rmdir $(TOPLVL)/image
+endef
+
+define subjectprefix
+	git config format.subjectPrefix "PATCH $(1)"
+endef
+
+# If GITOLITE_BASE_URL is defined, sets a repo's push URL for that gitolite
+# instance. Accepts one argument: the path to the repo on gitolite. If
+# GITOLITE_BASE_URL is not defined, no push URL is set -- the shell's null
+# command is executed to act as a no-op.
+define gitoliteurl
+$(if $(GITOLITE_BASE_URL),git remote set-url --push origin $(GITOLITE_BASE_URL):$(1),:)
+endef
+
+# If USE_PACKAGE_MAPPING is defined, looks up the remote repo name for the
+# local repo name (passed as the argument) according to the mapping found in
+# the "pkg-mapping" file. Otherwise, return the local repo name.
+define remotepkgname
+$(if $(USE_PACKAGE_MAPPING),$$(awk -v P="$(1)" '$$1 == P { res=$$2 } END { print res ? res : P }' $(TOPLVL)/projects/common/pkg-mapping),$(1))
+endef
+
+# Enables the local RPM repo by installing package manager and Mock configs.
+# First argument is the path to the package manager config, and the second
+# argument is the path to the mock config. Each of these config files is
+# augmented for local repo support.
+define localrepoenable
+	@cp $(1) $(TOPLVL)/repo/yum.conf
+	@printf "\n\n[local]\nname=Local\nfailovermethod=priority\nenabled=1\ngpgcheck=0\n" >> $(TOPLVL)/repo/yum.conf
+	@printf "baseurl=file://$$(realpath $(TOPLVL))/repo/\n\n" >> $(TOPLVL)/repo/yum.conf
+	@cp $(2) $(TOPLVL)/repo/clear.cfg
+	@printf "\n\n[localrepo]\nname=Local repo\nfailovermethod=priority\nenabled=1\ngpgcheck=0\n" >> $(TOPLVL)/repo/clear.cfg
+	@printf "baseurl=file://$$(realpath $(TOPLVL))/repo/\n\n" >> $(TOPLVL)/repo/clear.cfg
+	@sed -i '/^"""/d; $$a"""' $(TOPLVL)/repo/clear.cfg
+endef
+
+# Disables the local RPM repo by removing the installed package manager and
+# Mock configuration files.
+localrepodisable:
+	@rm -f $(TOPLVL)/repo/yum.conf
+	@rm -f $(TOPLVL)/repo/clear.cfg
+
+# Runs createrepo_c (or createrepo) for the local RPM repo
+localrepocreate:
+	( cd $(TOPLVL)/repo ; if type createrepo_c 1>/dev/null 2>&1; then createrepo_c .; else createrepo .; fi );
+
+# Remove all RPMs from the local RPM repo
+localrepoclean:
+	@find $(TOPLVL)/repo -maxdepth 1 -name '*.rpm' -delete
+
+# Summarizes the local RPM repo status
+localrepostatus:
+	@if [ ! -d $(TOPLVL)/repo ]; then \
+		echo '** Local repo not found'; \
+		exit 0; \
+	fi; \
+	if [ -f $(TOPLVL)/repo/yum.conf ]; then \
+		echo '** Local repo enabled for Yum/DNF.'; \
+	else \
+		echo '** Local repo not enabled for Yum/DNF.'; \
+	fi; \
+	if [ -f $(TOPLVL)/repo/clear.cfg ]; then \
+		echo '** Local repo enabled for Mock.'; \
+	else \
+		echo '** Local repo not enabled for Mock.'; \
+	fi; \
+	echo -n '** Local repo package list: '; \
+	( \
+		cd "$(TOPLVL)/repo"; \
+		LC_COLLATE="C"; \
+		shopt -s nullglob; \
+		set -- *.rpm; \
+		if [ -n "$$1" ]; then \
+			printf '\n'; printf '%q\n' "$$@"; \
+		else \
+			printf 'none found\n'; \
+		fi; \
+	)
+
+# Detection of whether to use the local RPM repo occurs on-the-fly. Normally,
+# variable definitions appear in Makefile.config, but these variables are not
+# intended to be user-modifiable.
+ifeq ($(wildcard $(TOPLVL)/repo/clear.cfg),)
+MOCK_CONFIG_VAL = $(realpath $(MOCK_CONF))
+else
+MOCK_CONFIG_VAL = $(realpath $(TOPLVL)/repo/clear.cfg)
+USE_LOCAL_REPO = 1
+endif
+
+localreponotice:
+	@if [ -n "${USE_LOCAL_REPO}" ]; then \
+		printf '\n\n** NOTICE: Using local repo for the build. Continuing after 3 seconds.\n'; \
+		printf '** If this is not desired, run `make repodisable`.\n'; \
+		printf '** The repo can be re-enabled later with `make repoenable`.\n'; \
+		printf '** Run `touch $(TOPLVL)/repo/opt-in-build` to prevent the 3 second delay.\n\n\n'; \
+		[ -f $(TOPLVL)/repo/opt-in-build ] || sleep 3; \
+	fi >&2
+
+.PHONY: clean-old-rpms clean-old-logs clean-old-content
+clean-old-rpms:
+	rm -rf ./rpms
+	rm -f ./results/*.rpm
+
+clean-old-logs:
+	rm -f ./results/*.log
+
+clean-old-content: clean-old-rpms clean-old-logs
+
+.PHONY: require-pkg-repo-dir link-new-rpms
+require-pkg-repo-dir:
+	@if [ -z ${PKG_REPO_DIR} ]; then \
+		echo "Please specify PKG_REPO_DIR to indicate package repo location."; \
+		exit 1; \
+	fi
+
+link-new-rpms: require-pkg-repo-dir
+	mkdir -p ${PKG_REPO_DIR}/rpms
+	rm -f ${PKG_REPO_DIR}/rpms/*.rpm
+	find ${PKG_REPO_DIR}/results -maxdepth 1 -name '*.rpm' -exec ln {} ${PKG_REPO_DIR}/rpms/ \;
+	rm -f ${PKG_REPO_DIR}/rpms/*.src.rpm
+
+
+.PHONY: help
+##### Code
+# Make sure that HELPSPACE has exactly HELPLEN spaces in it
+EMPTY:= # An empty string
+HELPSPACE :=${EMPTY}                  ${EMPTY}
+HELPLEN := 18
+define HELPSCRIPTBODY :=
+# Skip all non help lines
+/^#help[ \t]/!d
+# see if this is a target, defined to be "#help" a single space or tab a word
+# and then a ":". You can therefore escape something like http://localhost
+# by adding an extra space. We lose extra indent, but we will anyhow
+# as we will feed this to fmt -t
+s/^#help[ \t]\([^ \t]*:\)[ \t]*/\1\n/
+ttarget
+# This is a continuation line
+s/^#help[ \t]*/${HELPSPACE}/
+b
+:target
+# Add on spaces to pad it out, then remove extra ones and the newline
+# almost does the correct thing if there are not enough spaces
+s/[\t ]*\n[ \t]*/${HELPSPACE}\n/
+s/^\(.\{${HELPLEN}\}\) */\1/
+s/\n//
+endef
+
+# Debugging hint, add 	'@echo "$${HELPSCRIPT}" | hexdump -C'
+help: export HELPSCRIPT=${HELPSCRIPTBODY}
+help:
+	@printf "%s\n" "The output below describes commands that can be invoked in this directory."
+	@printf "\n\nPossible commands:\n\n"
+	@sed "$${HELPSCRIPT}" ${MAKEFILE_LIST} | { fmt -t -w $${COLUMNS:-75} || cat ; }
+
