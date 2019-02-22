@@ -9,5 +9,5 @@ TOPLVL = .
 .PHONY: sources
 sources:
 	rm -rf projects/common
-	git clone git@github.com:YinThong/common.git projects/common
+	git clone https://github.com/clearlinux/common.git projects/common
 	$(MAKE) -f projects/common/Makefile.common sources TOPLVL=$(TOPLVL)
