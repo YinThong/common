@@ -1,13 +1,482 @@
-# Due to the recursive make call below, warnings will be issued as a result of
-# PKG_NAME being undefined in the other Makefile.common. Silence these warnings
-# by propogating the value from the environment.
-export PKG_NAME
-# For convenience, we set up a different hierarchy here than in the standard
-# common tooling setup, so override this value.
-TOPLVL = .
+#-*-makefile-*-
 
-.PHONY: sources
+all: build
+
+TOPLVL = ../..
+
+include $(TOPLVL)/projects/common/Makefile.config
+include $(TOPLVL)/projects/common/Makefile.shared
+
+SHELL  = /bin/bash
+
+SPECFILE = $(addsuffix .spec, $(PKG_NAME))
+
+SRPMVERS = $(shell [ ! -f $(SPECFILE) ] || rpmspec -D '_vendor clr' --srpm -q --queryformat '%{NAME}-%{VERSION}-%{RELEASE}\n' $(SPECFILE))
+SRPMFILE = results/$(SRPMVERS).src.rpm
+
+LATEST_RPMS = $(wildcard rpms/*.rpm)
+DEBUGINFO_RPM = $(wildcard rpms/*-debuginfo-*.rpm)
+RPMS ?= $(LATEST_RPMS)
+
+WITH_SUDO = $(shell cmp /usr/bin/mock /usr/sbin/mock &> /dev/null && echo sudo )
+
+# MOCK_CONFIG_VAL is set in Makefile.shared
+MOCK ?= $(WITH_SUDO) /usr/bin/mock -r $(MOCK_CONFIG_VAL) $(MOCK_OPTS)
+
+ifneq ($(wildcard upstream),)
+__allsources := $(notdir $(strip $(shell cat upstream)))
+__missingsources := $(filter-out $(wildcard ${__allsources}), ${__allsources})
+endif
+
+$(SPECFILE):
+	@[[ -f "$@" ]] || (\
+	  echo Error: $@ is missing. Please run \`make autospec\` to try and auto;\
+	  echo Error: generate one for you.;\
+	  exit 1 )
+
+upstream:
+	@[[ -f "$@" ]] || (\
+	  echo Error: The \"$@\" file is missing. Try running \`make autospec\` to;\
+	  echo Error: auto generate one for you. If you are not using autospec to;\
+	  echo Error: generate a spec file, specify the proper "Source*" entries in the;\
+	  echo Error: spec header, and try running \`make generateupstream\`.;\
+	  exit 1 )
+
+#help spdxcheck: Checks that the package license is a valid SPDX license,
+#help or that it is in the exceptions list.
+spdxcheck: $(SPECFILE)
+	@for LICENSE in `rpmspec -D '_vendor clr' --srpm -q --queryformat '%{LICENSE}\n' $(SPECFILE)`; do \
+		if ! grep -qx "$$LICENSE" $(TOPLVL)/projects/common/licenses-{spdx,exceptions,extra}; then FAIL=yes; echo "ERROR: License '$$LICENSE' is not an allowed SPDX license ID"; fi; \
+	done; test -z "$$FAIL"
+
+#help cvecheck: Checks
+#help for common vulnerabilities and exposures in your package.
+cvecheck:
+	# https://github.com/ikeydoherty/cve-check-tool
+	# Installation: https://github.com/ikeydoherty/cve-check-tool/wiki
+	cve-check-tool -M $(TOPLVL)/projects/common/mapping $(SPECFILE)
+
+#help clean: Cleans up the src.rpm file. but not the rpm files or log files.
+clean:
+	rm -f $(SRPMFILE)
+
+#help proper: Brings your copy of the package to a nearly clean git checkout state.
+proper: repodel
+	rm -rf results rpms
+	rm -f build.log.round*
+	rm -f mock_build.log mock_srpm.log $(__allsources) report.html
+
+#help mockclean: Clean all mock chroots and cache directories for all packages.
+mockclean:
+	$(MOCK) --clean --scrub=all
+
+#help mockproper: Clean mock chroot and cache directories for this package.
+mockproper:
+	$(MOCK) --clean --scrub=all --uniqueext=$(PKG_NAME)
+	$(MOCK) --clean --scrub=chroot --uniqueext=$(PKG_NAME)
+
+configemail:
+	@test -d .git || git init
+	@$(call subjectprefix,$(PKG_NAME))
+	@echo -n "Subject prefix email configured to: "
+	@git config --get format.subjectPrefix
+
+#help checkblacklist: Verify rpms files to not include banned files for Clear Linux OS.
+checkblacklist:
+	@$(TOPLVL)/projects/common/checkblacklist.sh $(TOPLVL)/projects/common/blacklist results/*.rpm
+
+prebuild-checks:
+
+#help build: Builds from current directory on your machine and puts log
+#help files and rpms in the results directory of your package.  If there
+#help are mutlple tar.gz files for a package, make will do make sources,
+#help which creates a src.rpm file from the spec file.
+#help Use MOCK_OPTS environment varible to pass down arbitrary mock options.
+build: prebuild-checks configemail $(SPECFILE) upstream $(SRPMFILE)
+	$(MOCK) $(SRPMFILE) --result=results/ --no-cleanup-after --uniqueext=$(PKG_NAME)
+	$(MAKE) link-new-rpms PKG_REPO_DIR="."
+	@perl $(TOPLVL)/projects/common/logcheck.pl results/build.log
+	@perl $(TOPLVL)/projects/common/count.pl results/build.log &> testresults
+	@$(MAKE) checkblacklist
+
+#help build-nocheck: Same as 'make build', but do not run the package's test suite.
+build-nocheck: configemail $(SPECFILE) upstream $(SRPMFILE)
+	$(MOCK) $(SRPMFILE) --nocheck --result=results/ --no-cleanup-after --uniqueext=$(PKG_NAME)
+	$(MAKE) link-new-rpms PKG_REPO_DIR="."
+	@perl $(TOPLVL)/projects/common/logcheck.pl results/build.log
+	@perl $(TOPLVL)/projects/common/count.pl results/build.log &> testresults
+	@$(MAKE) checkblacklist
+
+fmvpatches: results/build.log
+	@perl $(TOPLVL)/projects/common/fmvpatches.pl $(PKG_NAME)
+
+#help rootshell: Puts you in a root shell at the top of your build root.
+rootshell:
+	$(MOCK) --result=results/ --no-cleanup-after --shell --uniqueext=$(PKG_NAME)
+
+#help shell: Puts you in a user shell in the home directory in the build root.
+shell:
+	$(MOCK) --result=results/ --no-cleanup-after --shell --uniqueext=$(PKG_NAME) --unpriv "cd && exec \$$SHELL -l -i"
+
+# Always rebuild the source rpm
+.PHONY: $(SRPMFILE)
+$(SRPMFILE): $(SPECFILE) $(__allsources) localreponotice clean-old-content
+	@$(MAKE) spdxcheck
+	$(MOCK) --buildsrpm --source=./ --spec=$(SPECFILE) --result=results/ --no-cleanup-after --uniqueext=$(PKG_NAME)
+	mv results/root.log results/srpm-root.log
+	mv results/build.log results/srpm-build.log
+
+# Do a git fetch and a git rebase to apply local commits on top of latest
+# commits from the remote. A git fetch/rebase is used rather than a git pull so
+# aborting the git pull at a password prompt doesn't leave local changes
+# stashed. Do the git status dance so we only apply a stash we create. Note
+# that a fetch/rebase is not attempted if the remote 'origin' is not
+# initialized locally, or if the remote contains no commits.
+pullrebase:
+	@if [ -z "$$SKIP_GIT" ] && [ -e .git ]; then \
+		if ! git rev-parse --verify --quiet origin/master > /dev/null; then \
+			echo "Remote not yet initialized. Continuing."; \
+			exit 0; \
+		fi; \
+		echo "Fetching origin"; \
+		git fetch; \
+		if ! git rev-parse --verify --quiet FETCH_HEAD > /dev/null; then \
+			echo "No commits exist in remote. Continuing."; \
+			exit 0; \
+		fi; \
+		echo "Rebasing to origin/master"; \
+		if git status --porcelain | grep -q '^.[^?]'; \
+		then \
+			git stash save; \
+			git rebase FETCH_HEAD; \
+			git stash apply; \
+		else \
+			git rebase FETCH_HEAD; \
+		fi \
+	fi
+
+preautospec-checks:
+
+#help autospec: automatically generates a specfile. If there is
+#help already a specfile, it will be overwritten. Several files used by
+#help autospec will be created in the process.
+#help Use MOCK_OPTS environment varible to pass down arbitrary mock options
+#help to autospec.
+#help For more information, see the project at https://github.com/clearlinux/autospec
+autospec: preautospec-checks pullrebase localreponotice clean-old-content
+	@if [ -e $(SPECFILE) ] && ! grep -q "# Generated by: autospec.py" $(SPECFILE) ; then \
+		echo "Specfile already exists and was not created by autospec.py! Aborting."; \
+		exit 1; \
+	fi
+	@printf 'PKG_NAME := %s\nURL = %s\nARCHIVES = %s\n\ninclude ../common/Makefile.common\n' $(PKG_NAME) '$(firstword $(value NEWURL) $(value URL))' '$(value ARCHIVES)' > Makefile
+	python3 $(TOPLVL)/projects/autospec/autospec/autospec.py \
+		--target . \
+		--integrity \
+		--config "$(AUTOSPEC_CONF)" \
+		--name $(PKG_NAME) \
+		--archives $(ARCHIVES) \
+		--mock-config $(MOCK_CONFIG_VAL) \
+		--mock-opts "$(MOCK_OPTS)" \
+		$${SETVERSION:+ --version $${SETVERSION}} \
+		${NON_INTERACTIVE} ${SKIP_GIT} ${CLEANUP} \
+		$(firstword $(NEWURL) $(URL));
+	$(MAKE) link-new-rpms PKG_REPO_DIR="."
+	@$(MAKE) spdxcheck
+	@$(MAKE) checkblacklist
+	@if [ -e update_changelog.sh ] && [ -z "$$SKIP_GIT" ] ; then \
+		bash update_changelog.sh ; \
+		git commit --amend --no-edit Change* ; \
+	fi
+
+#help autospecnogit: Runs autospec, but does not create a commit
+autospecnogit:
+	$(MAKE) SKIP_GIT=--skip-git autospec
+
+#help autospecnostate: Runs autospec, but cleans up mock chroots
+#help and disables interactive mode.
+autospecnostate:
+	$(MAKE) CLEANUP=-C NON_INTERACTIVE=--non_interactive autospec
+
+scanlicense:
+	python3 $(TOPLVL)/projects/autospec/autospec/autospec.py -t . --config $(AUTOSPEC_CONF) --license-only $(firstword $(NEWURL) $(URL)) --name $(PKG_NAME)
+
+#help bump: Increments the release file by one.
+bump:
+	git pull --rebase
+	$(MAKE) bumpnogit
+	git add *.spec release
+	git commit -a -m "version bump from $(shell rpmspec -D '_vendor clr' --srpm -q --queryformat '%{VERSION}-%{RELEASE}\n' $(SPECFILE)) to `rpmspec -D '_vendor clr' --srpm -q --queryformat '%{VERSION}-%{RELEASE}\n' $(SPECFILE)`"
+
+#help bumpnogit: Increments the release file by one and does not commit changes.
+bumpnogit:
+	@$(MAKE) spdxcheck
+	oldrel=$(shell rpmspec -D '_vendor clr' --srpm -q --queryformat '%{RELEASE}\n' $(SPECFILE)); \
+	newrel=$$(($$oldrel + 1)); \
+	sed -i "s/^\(Release[[:blank:]]*:[[:blank:]]*\)$$oldrel$$/\1$$newrel/" $(SPECFILE); \
+	echo "$$newrel" > release;
+
+$(__missingsources): sources
+
+# First argument is a Clear Linux build number (e.g. 22000)
+define fetch-from-srpm
+	tmp=$$(mktemp -d -p "."); \
+	srpm=$$(rpmspec --srpm -q --qf "%{NVR}.src.rpm\n" $(SPECFILE)); \
+	if cd "$$tmp" && ! curl -s -S -f -L -O $(MIRROR_CURL_OPTS) $(DOWNLOAD_MIRROR)/releases/$(1)/clear/source/SRPMS/$$srpm; then \
+		echo "Failed to download $$srpm from Clear Linux release $(1)." >&2; \
+		cd .. && rm -rf "$$tmp"; \
+		exit 1; \
+	fi; \
+	rpm2cpio $$srpm | cpio --quiet -id; \
+	cd ..; \
+	srclist=$$(rpmspec --srpm -q --qf "[%{SOURCE}\n]" $(SPECFILE)); \
+	for s in $$srclist; do \
+		if ! mv --no-clobber "$$tmp"/$$s .; then \
+			echo "Missing source file \"$$s\" in $${srpm}." >&2; \
+			rm -rf "$$tmp"; \
+			exit 1; \
+		fi; \
+		echo "Retrieved source file $$s ..."; \
+	done; \
+	rm -rf "$$tmp"
+endef
+
+#help sources: If SOURCES_URL is defined, download required upstream source files
+#help from that location. Otherwise, try to download source files according to the
+#help URLs listed in the spec file. If any of the source files fail to download,
+#help check for the relevant SRPM from published releases of Clear Linux OS, and
+#help extract the files if found. Note that SRPMs are taken from the DOWNLOAD_MIRROR
+#help location. This will run automatically, as a dependency. NOTE: A Koji server can
+#help make use of this "make sources" command, since it lives in a repo named
+#help "common". If you use this makefile in Koji, ensure "make sources" continues to
+#help work for both remote and local builds, since it is a prerequisite of several
+#help commands for building packages.
+ifneq ($(strip $(SOURCES_URL)),)
+sources: upstream
+	while read u; do \
+		case "$$u" in \
+			"")    continue ;; \
+			*://*) n="$$u" ;; \
+			*)     n="$(SOURCES_URL)/$$u" ;; \
+		esac; \
+		if ! curl --fail -L -o `basename "$$n"` $(SOURCES_CURL_OPTS) "$$n"; then \
+			echo "Failed to download $$n"; \
+			exit 1; \
+		fi; \
+	done < upstream
+else
 sources:
-	rm -rf projects/common
-	git clone https://github.com/clearlinux/common.git projects/common
-	$(MAKE) -f projects/common/Makefile.common sources TOPLVL=$(TOPLVL)
+	@$(MAKE) generateupstream; \
+	[ $$? -eq 0 ] && exit 0; \
+	nvr="$$(rpmspec --srpm -q --qf '%{NAME}\t%{VERSION}\t%{RELEASE}\n' $(SPECFILE))"; \
+	latest_builds=$$(git -C $(TOPLVL)/projects/common tag -l | sort -rn); \
+	for b in $$latest_builds; do \
+		url="$(DOWNLOAD_MIRROR)/releases/$$b/clear/source/package-sources"; \
+		echo "Checking for source files in build $$b ..."; \
+		if grep -q "$$nvr" <(curl -s -f -L $(MIRROR_CURL_OPTS) $$url); then \
+			$(call fetch-from-srpm,$$b); \
+			if [ $$? -eq 0 ]; then \
+				echo "Source files retrieved from build $$b"; \
+				exit 0; \
+			fi; \
+		fi; \
+	done; \
+	echo "Source files not found for package"; \
+	exit 1
+endif
+
+prekoji-checks:
+
+#help koji: Creates a git tag on the latest local commit, then asks koji to
+#help build from that tag on the server. If you have uncommitted local changes,
+#help they will not be included.
+koji: prekoji-checks kojidef
+	@$(MAKE) spdxcheck
+	@$(MAKE) checkblacklist
+	@if ! git branch | grep -q -E '^\* master'; then \
+		echo "Error: Must be on the master branch to submit to koji" >&2; \
+		exit 1; \
+	fi; \
+	if ! git diff --quiet HEAD ${SPECFILE}; then \
+		echo "Error: All changes to ${SPECFILE} must be committed first" >&2; \
+		exit 1; \
+	fi; \
+	if git rev-parse --verify --quiet origin/master > /dev/null; then \
+		git pull --rebase; \
+	fi
+	git tag $(SRPMVERS)
+	git push origin master refs/tags/$(SRPMVERS)
+	$(KOJI_CMD) build $$KOJI_NOWAIT $(KOJI_TAG) $(PKG_BASE_URL)/$(PKG_NAME)?#$(SRPMVERS)
+
+#help rekoji: In case a previous 'make koji' failed, trigger a rebuild for the
+#help same tag.
+rekoji: kojidef
+	git pull --rebase
+	$(KOJI_CMD) build $$KOJI_NOWAIT $(KOJI_TAG) $(PKG_BASE_URL)/$(PKG_NAME)?#$(SRPMVERS)
+
+#help scratch: Performs scratch-build on package in the background.
+scratch: $(SPECFILE) upstream $(SRPMFILE) kojidef
+	$(KOJI_CMD) build --scratch --nowait --background $$KOJI_NOWAIT $(KOJI_TAG) $(SRPMFILE)
+
+#help scratch-wait: Performs scratch-build on package.
+scratch-wait: $(SPECFILE) upstream $(SRPMFILE) kojidef
+	$(KOJI_CMD) build --scratch $(KOJI_TAG) $(SRPMFILE)
+
+#help koji-nowait: Same as 'make koji', but do not block
+koji-nowait:
+	$(MAKE) KOJI_NOWAIT="--nowait --background" koji &
+
+#help rekoji-nowait: Same as 'make rekoji', but do not block
+rekoji-nowait:
+	$(MAKE) KOJI_NOWAIT="--nowait --background" rekoji
+
+logcheck:
+	@perl $(TOPLVL)/projects/common/logcheck.pl results/build.log
+
+$(TOPLVL)/repo:
+	@echo "Creating local RPM repository $(TOPLVL)/repo"
+	mkdir $(TOPLVL)/repo
+	$(MAKE) localrepocreate
+
+#help repoadd: Adds locally-built RPMs for this package to the local RPM
+#help repository. If this repository does not yet exist, it is created and
+#help enabled.
+repoadd: $(TOPLVL)/repo
+	@if [ -z "${LATEST_RPMS}" ]; then \
+		echo "No rpms found in rpms/ directory."; \
+		exit 1; \
+	fi; \
+	if [ -f .repo-index ]; then \
+		echo "Cleaning old rpms:"; \
+		for r in `cat .repo-index`; do \
+			echo "-$$r"; \
+			rm -f $(TOPLVL)/repo/$$r; \
+		done; \
+		rm .repo-index; \
+	fi; \
+	for r in ${LATEST_RPMS}; do \
+		echo "+$$r"; \
+		echo $$(basename $$r) >> .repo-index; \
+		ln -f $$r $(TOPLVL)/repo/; \
+	done
+	$(MAKE) localrepocreate
+	$(call localrepoenable,${PM_CONF},${MOCK_CONF})
+
+#help repodel: Removes RPMs from the local RPM repository that were
+#help previously added by 'make repoadd' for this package.
+repodel:
+	@if [ -f .repo-index ]; then \
+		echo "Cleaning old rpms:"; \
+		for r in `cat .repo-index`; do \
+			echo "-$$r"; \
+			rm -f $(TOPLVL)/repo/$$r; \
+		done; \
+		rm .repo-index; \
+		$(MAKE) localrepocreate; \
+	fi
+
+#help repoenable: Enables the local RPM repository for use with Yum/DNF and
+#help Mock. If this repository does not yet exist, it is created.
+repoenable: $(TOPLVL)/repo ; $(call localrepoenable,${PM_CONF},${MOCK_CONF})
+
+#help repodisable: Disables the local RPM repository.
+repodisable: localrepodisable ;
+
+#help repostatus: Summarizes the local RPM repository status.
+repostatus: localrepostatus ;
+
+loop-up:
+	$(loopup)
+
+loop-down:
+	$(loopdown)
+
+#help install: Install locally built RPMs for this package into an image
+#help located at ../../clear.img. Make sure the image is not being used before
+#help running this rule! Note that debuginfo RPMs are installed to the cache
+#help directory used by the automatic debuginfo system in Clear Linux.
+install:
+	@$(MAKE) loop-up DEVICE=6 TARGET=$(TOPLVL)/clear.img
+	topdir=$(TOPLVL)/image; \
+	for r in $(RPMS); do rpm2cpio $$r | (cd $$topdir; sudo cpio -i -d -u); done; \
+	for dir in lib src; do \
+		if [ -d $$topdir/usr/$$dir/debug ]; then \
+			find $$topdir/usr/$$dir/debug -type f -o -type l | while read path; do \
+				newpath=`echo $$path | sed "s|\($$topdir\)/usr/$$dir/debug|\1/var/cache/debuginfo/$$dir|"`; \
+				sudo mkdir -p `dirname $$newpath`; \
+				sudo mv -f $$path $$newpath; \
+			done; \
+		fi; \
+	done
+	@$(MAKE) loop-down DEVICE=6
+
+#help install-debuginfo-local: Install locally built debuginfo RPM to
+#help the automatic debuginfo cache location (/var/cache/debuginfo)
+install-debuginfo-local:
+	tmpdir=$$(mktemp -d); \
+	rpm2cpio ${DEBUGINFO_RPM} | ( cd $$tmpdir; cpio -i -d -u); \
+	dest=/var/cache/debuginfo/lib; \
+	find $$tmpdir/usr/lib/debug/ -mindepth 1 -maxdepth 1 | while read -r d; do \
+		sudo chown -R dbginfo:dbginfo "$$d"; \
+		sudo cp -a "$$d" $$dest/; \
+	done; \
+	dest=/var/cache/debuginfo/src; \
+	find $$tmpdir/usr/src/debug/ -mindepth 1 -maxdepth 1 | while read -r d; do \
+		sudo chown -R dbginfo:dbginfo "$$d"; \
+		sudo cp -a "$$d" $$dest/; \
+	done; \
+	sudo rm -rf $$tmpdir
+
+#help install-local: Install locally built RPMs to the root filesystem. Note that the
+#help debuginfo RPM installs to /var/cache/debuginfo
+install-local:
+	for r in $(filter-out ${DEBUGINFO_RPM},${RPMS}); do \
+		rpm2cpio $$r | (cd /; sudo cpio -i -d -u); \
+	done
+	$(MAKE) install-debuginfo-local
+
+#help install-mock: Install locally built RPMs to the mock rootcache
+#help filesystem. This command is usually used with "make shell".
+install-mock: repoadd
+	$(MOCK) --result=results/ --no-cleanup-after --uniqueext=$(PKG_NAME) -i $(filter-out ${DEBUGINFO_RPM},${RPMS})
+
+#help generateupstream: Run this rule to create or update the 'upstream' file
+#help by downloading the upstream source tarballs listed in the spec file and
+#help calculating their hashes. Autospec performs this step automatically, so
+#help ignore it for packages managed with autospec. Additional curl options
+#help may be used for downloading the upstream source tarballs by defining the
+#help CURL_OPTS variable for this rule.
+generateupstream:
+	@[ -e upstream ] && mv upstream upstream.bak; \
+	urls=$$(rpmspec -D '_vendor clr' -P $(SPECFILE) | sed -n "s|^Source[0-9]*[[:blank:]]*:[[:blank:]]*\(..*://..*\)$$|\1|p"); \
+	for url in $$urls; do \
+		filename=$$(basename $$url); \
+		if [ ! -e $$filename ]; then \
+			if ! curl --fail -L -O $(CURL_OPTS) $$url; then \
+				echo "Failed to download $$url"; \
+				[ -e upstream.bak ] && mv --no-clobber upstream.bak upstream; \
+				exit 1; \
+			fi; \
+		fi; \
+		echo $$(sha1sum $$filename | cut -d\  -f1)/$$filename >> upstream; \
+	done
+	@rm -f upstream.bak
+	@cat upstream
+
+#help drop-abandoned: Remove all unused patches from the git tree
+drop-abandoned: $(SPECFILE)
+	python3 $(TOPLVL)/projects/common/drop-abandoned-patches.py $(SPECFILE)
+
+#help cloc: Count lines of code with the `cloc` tool on the full sources of package
+cloc: $(SRPMFILE)
+	@$(MOCK) -r $(TOPLVL)/repo/clear.cfg $(SRPMFILE) --result=results/ --no-cleanup-after
+	@$(MOCK) --chroot --copyin /usr/bin/cloc /usr/bin/cloc --result=results/ --no-cleanup-after
+	@$(MOCK) --result=results/ --no-cleanup-after --chroot '/usr/bin/cloc /builddir > /tmp/cloc.txt'
+	@$(MOCK) --copyout /tmp/cloc.txt results/ --result=results/
+	@$(MOCK) --clean --scrub=chroot --uniqueext=$(PKG_NAME)
+	cat results/cloc.txt
+
+# Define site local common targets in a separate makefile
+-include $(TOPLVL)/projects/common/Makefile.common.site_local
+
+# Include optional extended makefiles from individual package repos
+-include Makefile.custom
